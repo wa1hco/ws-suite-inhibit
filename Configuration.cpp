@@ -5503,10 +5503,12 @@ bool Configuration::impl::open_rig (bool force)
           rig_connections_ << connect (rig.get (), &Transceiver::tx_inhibit_changed,
                                        this, [this] (bool inhibited, QString const& source
                                                      , quint32 hold_rx, quint32 release_rx
-                                                     , quint32 expiries, quint32 invalid) {
+                                                     , quint32 expiries, quint32 invalid
+                                                     , qint64 t_rx_ns, qint64 t_pin_ns) {
                                          Q_EMIT self_->tx_inhibit_changed (inhibited, source
                                                                            , hold_rx, release_rx
-                                                                           , expiries, invalid);
+                                                                           , expiries, invalid
+                                                                           , t_rx_ns, t_pin_ns);
                                        });
           rig_connections_ << connect (rig.get (), &Transceiver::tx_inhibit_port_bound,
                                        this, [this] (quint16 port) {
@@ -5932,7 +5934,7 @@ void Configuration::impl::close_rig ()
   // m_tx_inhibited (display-only) could stick on "Inhibit" until a later hold.
   tx_inhibit_port_ = 0;
   Q_EMIT self_->tx_inhibit_port_changed (0);
-  Q_EMIT self_->tx_inhibit_changed (false, QString {}, 0, 0, 0, 0);
+  Q_EMIT self_->tx_inhibit_changed (false, QString {}, 0, 0, 0, 0, 0, 0);
 }
 
 // find the audio device that matches the specified name, also

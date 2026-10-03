@@ -62,9 +62,12 @@ signals:
   void physicalPtt (bool radiate);
 
   // Queued to GUI: status-bar badge + optional InhibitStatus counters.
+  // t_rx_ns and t_pin_ns are CLOCK_MONOTONIC. Both are zero unless this
+  // emission is the hold that dropped a pin that was high.
   void inhibitChanged (bool inhibited, QString const& source
                        , quint32 hold_rx, quint32 release_rx
-                       , quint32 expiries, quint32 invalid);
+                       , quint32 expiries, quint32 invalid
+                       , qint64 t_rx_ns, qint64 t_pin_ns);
 
   // Non-fatal operator-visible problems.
   // Callers must not treat this as a rig CAT/PTT failure.
@@ -92,7 +95,7 @@ private:
   // calls rig_set_ptt, which throws; this is reached from timer and socket
   // slots where an escaping exception would abort the application.
   void emit_physical_ptt (bool radiate);
-  void emit_state_if_changed ();
+  void emit_state_if_changed (qint64 t_rx_ns = 0, qint64 t_pin_ns = 0);
   qint64 now_ms () const;
 
   // Monotonic time base for hold expiry: immune to system-clock steps, which

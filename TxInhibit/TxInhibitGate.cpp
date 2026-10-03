@@ -149,8 +149,14 @@ void TxInhibitGate::command (QString controller, quint32 ttl_ms, QString station
             }
         }
     }
+  bool const was_radiate = last_radiate_;
   apply_line ();
-  emit_state_if_changed ();
+  qint64 t_rx = 0;
+  qint64 t_pin = 0;
+  // The inhibit thread already dropped the pin and stored the ioctl time.
+  // This emission is the type 17 the probe pairs with that hold.
+  if (was_radiate && !last_radiate_) TxInhibitDrop::take_pin_stamps (t_rx, t_pin);
+  emit_state_if_changed (t_rx, t_pin);
 }
 
 void TxInhibitGate::note_invalid (quint64 count)
@@ -264,14 +270,22 @@ void TxInhibitGate::emit_physical_ptt (bool radiate)
     }
 }
 
-void TxInhibitGate::emit_state_if_changed ()
+void TxInhibitGate::emit_state_if_changed (qint64 t_rx_ns, qint64 t_pin_ns)
 {
   bool const inh = !holds_.isEmpty ();
   auto const badge = holder_summary ();
   if (inh != last_emitted_inhibited_ || badge != last_badge_)
     {
+      // do_ptt() stores pin intent on the drop, not on this gate, so
+      // last_radiate_ stays false in production. The pending pair is the
+      // record of a pin that actually fell. Attach it to this inhibited edge.
+      if (inh && t_rx_ns == 0 && t_pin_ns == 0)
+        {
+          TxInhibitDrop::take_pin_stamps (t_rx_ns, t_pin_ns);
+        }
       last_emitted_inhibited_ = inh;
       last_badge_ = badge;
-      Q_EMIT inhibitChanged (inh, badge, hold_rx_, release_rx_, expiries_, invalid_);
+      Q_EMIT inhibitChanged (inh, badge, hold_rx_, release_rx_, expiries_, invalid_
+                             , t_rx_ns, t_pin_ns);
     }
 }

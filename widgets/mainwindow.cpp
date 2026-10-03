@@ -4871,7 +4871,8 @@ void MainWindow::createStatusBar()                           //createStatusBar
   connect (&m_config, &Configuration::tx_inhibit_changed, this,
            [this] (bool inhibited, QString const& source
                    , quint32 hold_rx, quint32 release_rx
-                   , quint32 expiries, quint32 invalid) {
+                   , quint32 expiries, quint32 invalid
+                   , qint64 t_rx_ns, qint64 t_pin_ns) {
              m_tx_inhibited = inhibited;
              m_tx_inhibit_holder = inhibited ? source : QString {};
              update_inhibit_status ();
@@ -4881,7 +4882,8 @@ void MainWindow::createStatusBar()                           //createStatusBar
                  m_messageClient->inhibit_status (
                    m_config.enable_tx_inhibit (),
                    inhibited, source,
-                   hold_rx, release_rx, expiries, invalid);
+                   hold_rx, release_rx, expiries, invalid,
+                   t_rx_ns, t_pin_ns);
                }
            });
   connect (&m_config, &Configuration::tx_inhibit_port_changed, this,

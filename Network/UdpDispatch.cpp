@@ -3,9 +3,12 @@
 #include <QNetworkInterface>
 #include <QUdpSocket>
 #include <QtEndian>
+#include <QtGlobal>
 
 #include "NetworkMessage.hpp"
 #include "TxInhibit/TxInhibitDrop.hpp"
+#include "TxInhibit/TxInhibitThreadPriority.hpp"
+#include "moc_UdpDispatch.cpp"
 
 UdpDispatchWorker::UdpDispatchWorker (QObject * parent)
   : QObject {parent}
@@ -15,6 +18,18 @@ UdpDispatchWorker::UdpDispatchWorker (QObject * parent)
 void UdpDispatchWorker::init ()
 {
   if (sock_) return;
+  // This slot runs on udp-dispatch. The pin drop uses this same thread.
+  auto const prio = raise_inhibit_thread_priority ();
+  if (!prio.raised)
+    {
+      static bool warned = false;
+      if (!warned)
+        {
+          warned = true;
+          qWarning ("udp-dispatch: priority %d refused, error %d. Thread stays at normal priority.",
+                    prio.requested, prio.error);
+        }
+    }
   sock_ = new QUdpSocket {this};
   connect (sock_, &QUdpSocket::readyRead, this, &UdpDispatchWorker::read_pending);
 #if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
@@ -86,6 +101,15 @@ bool UdpDispatchWorker::is_unconnected () const
   return !sock_ || sock_->state () == QAbstractSocket::UnconnectedState;
 }
 
+// Cheap type check. The pin stamp is taken after this and before the id parse.
+static bool is_tx_inhibit_type (QByteArray const& msg)
+{
+  if (msg.size () < 12) return false;
+  auto const * bytes = reinterpret_cast<uchar const *> (msg.constData ());
+  if (qFromBigEndian<quint32> (bytes) != NetworkMessage::Builder::magic) return false;
+  return qFromBigEndian<quint32> (bytes + 8) == NetworkMessage::TxInhibit;
+}
+
 // 1 = inhibit, 0 = release, -1 = not a command this socket should apply.
 static int inhibit_level (QByteArray const& msg, bool commands_enabled, QString const& id)
 {
@@ -115,9 +139,9 @@ void UdpDispatchWorker::read_pending ()
       data.resize (static_cast<int> (sock_->pendingDatagramSize ()));
       quint16 sender_port = 0;
       if (sock_->readDatagram (data.data (), data.size (), nullptr, &sender_port) < 0) continue;
-      // After the read returns the thread is on a core. The gap from the
-      // sender's monotonic_ns() to t_pin is the wake plus this work.
-      qint64 const t_rx = TxInhibitDrop::monotonic_ns ();
+      // t_rx is monotonic_ns() at this socket read, and only for a type 18.
+      // The id parse and the pin write come after it.
+      qint64 const t_rx = is_tx_inhibit_type (data) ? TxInhibitDrop::monotonic_ns () : 0;
       int const level = inhibit_level (data, commands_enabled_, id_);
       // Type 18 changes the pin on this thread, before the GUI sees it.
       if (level >= 0) TxInhibitDrop::set_inhibit_here (level == 1, t_rx);

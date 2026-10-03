@@ -95,10 +95,12 @@ public:
 
   // Type 17. Repeated after each Heartbeat while supported, and sent
   // again when the snapshot changes. supported false withdraws it.
+  // t_rx_ns and t_pin_ns are CLOCK_MONOTONIC. Zero on the heartbeat repeat.
   Q_SLOT void inhibit_status (bool supported, bool inhibited
                               , QString const& source_station
                               , quint32 hold_rx, quint32 release_rx
-                              , quint32 expiries, quint32 invalid);
+                              , quint32 expiries, quint32 invalid
+                              , qint64 t_rx_ns, qint64 t_pin_ns);
 
   // this signal is emitted if the server has requested a decode
   // window clear action

@@ -515,7 +515,8 @@ public:
   // source empty when clear; otherwise badge text ("TX INHIBITED — …").
   Q_SIGNAL void tx_inhibit_changed (bool inhibited, QString const& source
                                     , quint32 hold_rx, quint32 release_rx
-                                    , quint32 expiries, quint32 invalid) const;
+                                    , quint32 expiries, quint32 invalid
+                                    , qint64 t_rx_ns, qint64 t_pin_ns) const;
   Q_SIGNAL void tx_inhibit_port_changed (quint16 port) const;
   // Type 18, from MessageClient on the reporting socket to the rig thread.
   Q_SIGNAL void tx_inhibit_command (QString const& controller, quint32 ttl_ms,

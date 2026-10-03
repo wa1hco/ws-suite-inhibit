@@ -17,7 +17,6 @@
 
 #include "NetworkMessage.hpp"
 #include "UdpDispatch.hpp"
-#include "TxInhibit/TxInhibitDrop.hpp"
 #include "qt_helpers.hpp"
 #include "pimpl_impl.hpp"
 
@@ -112,7 +111,8 @@ public:
   void invalid_inhibit ();
   bool inhibit_available () const;
   void update_inhibit_status (bool supported, bool inhibited, QString const& source_station,
-                              quint32 hold_rx, quint32 release_rx, quint32 expiries, quint32 invalid);
+                              quint32 hold_rx, quint32 release_rx, quint32 expiries, quint32 invalid,
+                              qint64 t_rx_ns, qint64 t_pin_ns);
   void send_inhibit_status (bool supported, qint64 t_rx_ns = 0, qint64 t_pin_ns = 0);
   static bool has_our_magic (QByteArray const& datagram)
   {
@@ -574,17 +574,10 @@ bool MessageClient::impl::inhibit_available () const
 
 void MessageClient::impl::update_inhibit_status (
   bool supported, bool inhibited, QString const& source_station,
-  quint32 hold_rx, quint32 release_rx, quint32 expiries, quint32 invalid)
+  quint32 hold_rx, quint32 release_rx, quint32 expiries, quint32 invalid,
+  qint64 t_rx_ns, qint64 t_pin_ns)
 {
   auto const was_available = inhibit_available ();
-  qint64 t_rx_ns = 0;
-  qint64 t_pin_ns = 0;
-  // The pair belongs to the edge that reports a new hold. A refresh
-  // and a heartbeat send zeros.
-  if (inhibited && !inhibit_status_.inhibited)
-    {
-      TxInhibitDrop::take_pin_stamps (t_rx_ns, t_pin_ns);
-    }
   inhibit_status_.valid = true;
   inhibit_status_.supported = supported;
   inhibit_status_.inhibited = inhibited;
@@ -608,7 +601,8 @@ void MessageClient::impl::send_inhibit_status (bool supported, qint64 t_rx_ns, q
       << inhibit_status_.expiries << inhibit_status_.invalid
       << static_cast<quint64> (t_rx_ns) << static_cast<quint64> (t_pin_ns);
   TRACE_UDP ("supported:" << supported << "inhibited:" << inhibit_status_.inhibited
-             << "source:" << inhibit_status_.source_station);
+             << "source:" << inhibit_status_.source_station
+             << "t_rx_ns:" << t_rx_ns << "t_pin_ns:" << t_pin_ns);
   send_message (out, message, false, true);
 }
 
@@ -780,10 +774,12 @@ void MessageClient::decode (bool is_new, QTime time, qint32 snr, float delta_tim
 void MessageClient::inhibit_status (bool supported, bool inhibited
                                     , QString const& source_station
                                     , quint32 hold_rx, quint32 release_rx
-                                    , quint32 expiries, quint32 invalid)
+                                    , quint32 expiries, quint32 invalid
+                                    , qint64 t_rx_ns, qint64 t_pin_ns)
 {
   m_->update_inhibit_status (supported, inhibited, source_station,
-                             hold_rx, release_rx, expiries, invalid);
+                             hold_rx, release_rx, expiries, invalid,
+                             t_rx_ns, t_pin_ns);
 }
 
 void MessageClient::WSPR_decode (bool is_new, QTime time, qint32 snr, float delta_time, Frequency frequency

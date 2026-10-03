@@ -19,6 +19,7 @@ __pycache__
 cmake-build-debug
 cmake-build-release
 /build/
+scratch/
 CMakeFiles
 fnd
 lib/77bit/tmp

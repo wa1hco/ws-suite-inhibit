@@ -170,6 +170,8 @@ public:
     , do_pwr2_ {false}
     , do_swr_ {false}
     , do_alc_ {false}
+    , release_cat_rts_ {true}
+    , release_cat_dtr_ {true}
   {
   }
 
@@ -194,6 +196,8 @@ public:
     , do_pwr2_ {false}
     , do_swr_ {false}
     , do_alc_ {false}
+    , release_cat_rts_ {!(params.force_rts && params.rts_high)}
+    , release_cat_dtr_ {!(params.force_dtr && params.dtr_high)}
   {
   }
 
@@ -239,6 +243,10 @@ public:
   bool do_pwr2_;
   bool do_swr_;
   bool do_alc_;
+  // Separate PTT port: the CAT open leaves RTS and DTR high. Drop a
+  // line here unless Settings forces that line high.
+  bool release_cat_rts_;
+  bool release_cat_dtr_;
 
   static int debug_callback (enum rig_debug_level_e level, rig_ptr_t arg, char const * format, va_list ap);
 };
@@ -921,17 +929,26 @@ int HamlibTransceiver::do_start ()
             }
           else
             {
-              int fd = ::open (ptt->pathname, O_RDWR | O_NOCTTY | O_NONBLOCK);
-              if (fd >= 0)
+              // CAT is not the PTT port. Opening it asserts RTS and DTR,
+              // and an Icom USB SEND line then holds the rig in transmit.
+              unsigned drop = 0;
+              if (m_->release_cat_rts_) drop |= TIOCM_RTS;
+              if (m_->release_cat_dtr_) drop |= TIOCM_DTR;
+              if (drop != 0 && cat->fd >= 0)
                 {
-                  unsigned both = TIOCM_RTS | TIOCM_DTR;
-                  ioctl (fd, TIOCMBIC, &both);
-                  TxInhibitDrop::publish (fd, bit, true);
+                  ioctl (cat->fd, TIOCMBIC, &drop);
                 }
-              else
+              // Hamlib may still hold the PTT device from rig_open, with
+              // both lines high. Close it. publish_separate opens it for
+              // as long as this port stays selected.
+              if (ptt->fd >= 0 && ptt->fd != cat->fd)
                 {
-                  CAT_TRACE ("TX Inhibit: cannot open PTT port " << ptt->pathname);
+                  unsigned const both = TIOCM_RTS | TIOCM_DTR;
+                  ioctl (ptt->fd, TIOCMBIC, &both);
+                  ::close (ptt->fd);
+                  ptt->fd = -1;
                 }
+              TxInhibitDrop::publish_separate (ptt->pathname, bit);
             }
         }
 #elif defined(Q_OS_WIN)

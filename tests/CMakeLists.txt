@@ -27,6 +27,16 @@ target_link_libraries (test_pin_combiner Qt5::Test)
 target_include_directories (test_pin_combiner PRIVATE ${CMAKE_SOURCE_DIR})
 add_test (test_pin_combiner test_pin_combiner)
 
+add_executable (test_tx_inhibit_thread_priority test_tx_inhibit_thread_priority.cpp)
+target_link_libraries (test_tx_inhibit_thread_priority Qt5::Test)
+target_include_directories (test_tx_inhibit_thread_priority PRIVATE ${CMAKE_SOURCE_DIR})
+add_test (test_tx_inhibit_thread_priority test_tx_inhibit_thread_priority)
+
+add_executable (test_inhibit_status_datagram test_inhibit_status_datagram.cpp)
+target_link_libraries (test_inhibit_status_datagram Qt5::Test Qt5::Network)
+target_include_directories (test_inhibit_status_datagram PRIVATE ${CMAKE_SOURCE_DIR})
+add_test (test_inhibit_status_datagram test_inhibit_status_datagram)
+
 add_executable (test_tx_inhibit_logic test_tx_inhibit_logic.cpp)
 target_link_libraries (test_tx_inhibit_logic wsjt_qt Qt5::Test Qt5::Network)
 add_test (test_tx_inhibit_logic test_tx_inhibit_logic)

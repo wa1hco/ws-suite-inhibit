@@ -442,29 +442,38 @@ needs them; neither is implemented, so do not assume either.
 
 ---
 
-## 5. Local CTS KEY — not in this build
+## 5. Local CTS KEY — not read yet
 
-**Decision:** no CTS in the WSJT-X station binary. **UDP hold only** + RTS/DTR PTT.
+The separate PTT port is opened when it is selected and closed when it is
+given up. Linux `open()` asserts RTS and DTR, so both lines are cleared
+once. After that only the selected PTT bit is written. The other line stays
+released. Windows already holds its COM handle and clears both lines once
+at open.
 
-**Why:** floating/driven CTS caused intermittent false hold. Worse than
-requiring a KEY agent (or the `inhibit-test` helper) on UDP.
-
-Until CTS is opt-in and safe: KEY agent → UDP, or localhost helper.
+CTS on that port is the KEY input from the SSB/CW radio. It is not read.
+A raw CTS level has caused a false hold when the line floated. A future CTS
+source is the same CW detect and hang as the SSB/CW agent, OR'd with the
+type 18 hold. The station still does not apply that hang to a type 18
+packet. The agent has already done it.
 
 ---
 
 ## 6. Testing locally
 
-Enable TX Inhibit, RTS/DTR on a real serial port, then send the same UDP a KEY
-agent would (default **127.0.0.1:22372**). Expect red **TX INHIBITED**; WSJT-X station
-does not **assert PTT** while hold is active.
+Enable TX Inhibit and RTS/DTR on a real serial port, then run `inhibit-test`.
+The tool listens for type 17 on localhost and on multicast `224.0.0.73` port `2237`.
+One supported source is selected.
+Two or more sources show a numbered menu.
+Type 18 goes to the selected sender.
+Expect red **TX INHIBITED**.
+The station does not **assert PTT** while the hold is active.
 
 ### `inhibit-test` / `inhibit-test-gui` (KEY-agent stand-ins)
 
 | Binary | Platform | Notes |
 |--------|----------|--------|
 | **`inhibit-test`** | Linux / Windows console | Canonical CLI (Qt). |
-| **`inhibit-test-gui`** | Windows GUI | Native Win32; mouse or grave; same protocol. |
+| **`inhibit-test-gui`** | Windows GUI | Native Win32; mouse or grave; JSON to UDP 22372. |
 
 Implements §3 (Hold sender + KEYing monitor):
 
@@ -484,16 +493,16 @@ KEY (long mark ≥500 ms) **hang = 0**. Override: `--fixed-hang-ms` (console) 
 **fixed hang ms** field (GUI).
 
 ```text
-inhibit-test --host 127.0.0.1 --port 22372 --station TEST-KEY --ttl-ms 600
+inhibit-test --station TEST-KEY --ttl-ms 600
 inhibit-test --fixed-hang-ms 0
 bin\inhibit-test-gui.exe
 ```
 
-If the WSJT-X station bound an ephemeral port, pass that `--port`.
+The type 18 command uses the source address and source port of the selected type 17.
 
-**Input focus:** console default = this terminal only (`--global-keys` = system-wide).
-GUI = keys only while the GUI window is focused. **Linux console:** group
-`input` required for `/dev/input`; without it **`inhibit-test` refuses to start**.
+**Input focus:** console default = this terminal only (`--global-keys` = system-wide when the OS key state is open).
+GUI = keys only while the GUI window is focused. Linux uses `/dev/input` when it opens.
+When that device is closed, the KEY comes from this terminal and the program still starts.
 
 **Digi RF checks:** hold `` ` `` ≥500 ms (continuous, hang 0) or fixed hang 0.
 

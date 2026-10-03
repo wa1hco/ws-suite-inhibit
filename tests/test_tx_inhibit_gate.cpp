@@ -16,6 +16,7 @@
 
 #include <QSignalSpy>
 
+#include "TxInhibit/TxInhibitDrop.hpp"
 #include "TxInhibit/TxInhibitGate.hpp"
 
 namespace
@@ -169,6 +170,44 @@ private slots:
                           .arg (elapsed)));
 
     gate.shutdown (false);
+  }
+
+  // Production do_ptt() does not call set_intent(). The inhibited edge
+  // still carries a pair the pin writer stored. A refresh does not take one.
+  void pinStampsRideTheInhibitedEdge ()
+  {
+    TxInhibitDrop::shutdown_here ();
+    TxInhibitGate gate;
+    gate.start_listening ();
+    QSignalSpy changed {&gate, &TxInhibitGate::inhibitChanged};
+
+    TxInhibitDrop::publish_pin_stamps (1000, 2500);
+    hold (gate, 5000, "LATPROBE");
+    QVERIFY (changed.count () >= 1);
+    QCOMPARE (changed.at (changed.count () - 1).at (0).toBool (), true);
+    QCOMPARE (changed.at (changed.count () - 1).at (6).toLongLong (), qint64 {1000});
+    QCOMPARE (changed.at (changed.count () - 1).at (7).toLongLong (), qint64 {2500});
+
+    int const refresh_at = changed.count ();
+    TxInhibitDrop::publish_pin_stamps (3000, 4000);
+    hold (gate, 5000, "LATPROBE");
+    QCOMPARE (changed.count (), refresh_at);
+    qint64 got_rx = 0;
+    qint64 got_pin = 0;
+    TxInhibitDrop::take_pin_stamps (got_rx, got_pin);
+    QCOMPARE (got_rx, qint64 {3000});
+    QCOMPARE (got_pin, qint64 {4000});
+
+    hold (gate, 0, "LATPROBE");
+    int const before_clear = changed.count ();
+    hold (gate, 5000, "LATPROBE");
+    QVERIFY (changed.count () > before_clear);
+    QCOMPARE (changed.at (changed.count () - 1).at (0).toBool (), true);
+    QCOMPARE (changed.at (changed.count () - 1).at (6).toLongLong (), qint64 {0});
+    QCOMPARE (changed.at (changed.count () - 1).at (7).toLongLong (), qint64 {0});
+
+    gate.shutdown (false);
+    TxInhibitDrop::shutdown_here ();
   }
 };
 

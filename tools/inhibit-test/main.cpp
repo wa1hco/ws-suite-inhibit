@@ -16,6 +16,10 @@
 // Default input: only keys typed into *this* terminal (not other windows).
 // Use --global-keys for system-wide KEY (true KEY-agent bench).
 //
+// Inhibit network: one socket receives type 17 on localhost and on
+// multicast 224.0.0.73:2237. One supported source is selected. Two or
+// more sources wait for a numbered choice. Type 18 goes to that sender.
+//
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <QCoreApplication>
@@ -30,6 +34,8 @@
 #include <QDateTime>
 #include <QtGlobal>
 #include <QSocketNotifier>
+
+#include "InhibitStatusDatagram.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -55,7 +61,9 @@
 
 namespace {
 
-static int const kDefaultPort = 22372;
+// WSJT-X UDP server port. Localhost and the multicast group share it.
+static char const * kDefaultMulticast = "224.0.0.73";
+static int const kDefaultStatusPort = 2237;
 // hold_timeout_ms (wire ttl_ms) — safety on lost hold packets, not hang.
 static int const kDefaultHoldTimeoutMs = 600;
 static int const kKeepaliveMs = 200;
@@ -72,22 +80,6 @@ static int const kContinuousMarkMs = 500;
 // Element gap upper bound while still "in character/word" (before hang EOT).
 // Letter gap = 3 dits; use up to ~5 dits as "still break-in" open.
 static double const kMaxIntraTxGapDits = 5.0;
-
-QByteArray encode_hold (QString const& station, QString const& band,
-                        qint64 seq, int ttl_ms)
-{
-  QByteArray body;
-  body += "{\"tx_inhibit\":1,\"ttl_ms\":";
-  body += QByteArray::number (ttl_ms);
-  body += ",\"station\":\"";
-  body += station.toUtf8 ();
-  body += "\",\"band\":\"";
-  body += band.toUtf8 ();
-  body += "\",\"seq\":";
-  body += QByteArray::number (seq);
-  body += '}';
-  return body;
-}
 
 // --- KEY level readers (grave/backtick ` — rare key, not Space) ------------
 // Linux: KEY_GRAVE. Windows: VK_OEM_3 (US `~ key). Stdin: '`' (or '~').
@@ -116,6 +108,8 @@ static bool g_stdin_quit = false;
 // distinguishes the two directly, which is more reliable than sampling the
 // shift key at poll time.
 static bool g_stdin_latch = false;
+// 1-9 from this TTY. 0 means no choice key is waiting.
+static int g_stdin_choice = 0;
 
 void restore_stdin_termios ()
 {
@@ -180,6 +174,10 @@ void poll_stdin_keys ()
                 {
                   g_stdin_latch = true;
                 }
+            }
+          else if (c >= '1' && c <= '9')
+            {
+              g_stdin_choice = c - '0';
             }
           else if (c == 'q' || c == 'Q' || c == 0x1b || c == 3 /* Ctrl-C */)
             {
@@ -335,9 +333,7 @@ bool open_evdev_keyboard ()
   else if (n_open_fail_eacces > 0)
     {
       g_evdev_fail_reason = QStringLiteral (
-          "permission denied on /dev/input (%1 devices; group 'input' required). "
-          "Fix: sudo usermod -aG input $USER   then log out and back in "
-          "(newgrp input is not enough for all sessions).")
+          "permission denied on /dev/input (%1 devices)")
           .arg (n_open_fail_eacces);
     }
   else if (n_no_grave > 0 && n_open_fail_other == 0)
@@ -432,6 +428,7 @@ bool quit_requested_evdev ()
 static bool g_win_key_armed = false;
 static bool g_win_stdin_quit = false;
 static bool g_win_latch_req = false;
+static int g_win_choice = 0;
 
 bool space_down_global ()
 {
@@ -470,6 +467,10 @@ void poll_win_console_chars ()
         {
           g_win_key_armed = true;
           g_win_latch_req = (c == '~');
+        }
+      else if (c >= '1' && c <= '9')
+        {
+          g_win_choice = c - '0';
         }
       else if (c == 'q' || c == 'Q' || c == 27)
         {
@@ -520,6 +521,24 @@ bool quit_requested_console ()
 }
 
 #endif
+
+// Choice keys are console bytes. Grave stays the KEY.
+int take_choice_digit ()
+{
+#if defined (Q_OS_LINUX)
+  poll_stdin_keys ();
+  int const choice = g_stdin_choice;
+  g_stdin_choice = 0;
+  return choice;
+#elif defined (Q_OS_WIN)
+  poll_win_console_chars ();
+  int const choice = g_win_choice;
+  g_win_choice = 0;
+  return choice;
+#else
+  return 0;
+#endif
+}
 
 // --- KEYing monitor (docs/TX_INHIBIT.md §3.2–3.5) ---------------------------
 
@@ -689,7 +708,7 @@ int main (int argc, char * argv[])
 {
   QCoreApplication app (argc, argv);
   QCoreApplication::setApplicationName (QStringLiteral ("inhibit-test"));
-  QCoreApplication::setApplicationVersion (QStringLiteral ("2.1"));
+  QCoreApplication::setApplicationVersion (QStringLiteral ("2.5"));
 
   QCommandLineParser parser;
   parser.setApplicationDescription (
@@ -698,25 +717,21 @@ int main (int argc, char * argv[])
           "KEY key = left quote / grave ` (not Space - typing won't false-trigger).\n"
           "Break-in CW: hang = 1.5x word gap; continuous KEY: hang 0.\n"
           "Default: KEY only from *this terminal* (other windows ignored).\n"
-          "Use --global-keys for system-wide KEY (true agent bench)."));
+          "Use --global-keys for system-wide KEY (true agent bench).\n"
+          "Listens for type 17 on localhost and multicast 224.0.0.73:2237.\n"
+          "One source is selected. Two or more sources need a number key.\n"
+          "Sends type 18 to the selected sender."));
   parser.addHelpOption ();
   parser.addVersionOption ();
-  QCommandLineOption hostOpt {QStringList () << "H" << "host",
-                              QStringLiteral ("WSJT-X station host (default 127.0.0.1)"),
-                              QStringLiteral ("host"),
-                              QStringLiteral ("127.0.0.1")};
-  QCommandLineOption portOpt {QStringList () << "p" << "port",
-                              QStringLiteral ("Inhibit UDP port (default 22372)"),
-                              QStringLiteral ("port"),
-                              QString::number (kDefaultPort)};
   QCommandLineOption stationOpt {QStringList () << "s" << "station",
-                                 QStringLiteral ("Badge station id"),
+                                 QStringLiteral ("Badge text in the type 18 command"),
                                  QStringLiteral ("name"),
                                  QStringLiteral ("TEST-KEY")};
-  QCommandLineOption bandOpt {QStringList () << "b" << "band",
-                              QStringLiteral ("Band field (informational)"),
-                              QStringLiteral ("band"),
-                              QStringLiteral ("144")};
+  QCommandLineOption controllerOpt {
+    QStringList () << "controller-id",
+    QStringLiteral ("Type 18 lease key (default inhibit-test). No spaces."),
+    QStringLiteral ("id"),
+    QStringLiteral ("inhibit-test")};
   QCommandLineOption ttlOpt {QStringList () << "t" << "ttl-ms",
                              QStringLiteral ("hold_timeout_ms on hold/keepalive packets (default 600)"),
                              QStringLiteral ("ms"),
@@ -731,20 +746,32 @@ int main (int argc, char * argv[])
   QCommandLineOption quietKaOpt {
     QStringList () << "verbose-keepalive",
     QStringLiteral ("Log every keepalive (default: HOLD, KEY events, RELEASE only).")};
-  parser.addOption (hostOpt);
-  parser.addOption (portOpt);
+  QCommandLineOption statusAddrOpt {
+    QStringList () << "status-addr",
+    QStringLiteral ("IPv4 type 17 address. Unicast listens only there. Multicast joins that group and localhost still receives. Omit for localhost plus 224.0.0.73."),
+    QStringLiteral ("addr")};
+  QCommandLineOption statusPortOpt {
+    QStringList () << "status-port",
+    QStringLiteral ("UDP server port for type 17 (default 2237)"),
+    QStringLiteral ("port"),
+    QString::number (kDefaultStatusPort)};
+  QCommandLineOption statusIfaceOpt {
+    QStringList () << "status-iface",
+    QStringLiteral ("Interface name for the type 17 multicast join. Omit for the OS default."),
+    QStringLiteral ("name")};
   parser.addOption (stationOpt);
-  parser.addOption (bandOpt);
+  parser.addOption (controllerOpt);
   parser.addOption (ttlOpt);
   parser.addOption (fixedHangOpt);
   parser.addOption (globalKeysOpt);
   parser.addOption (quietKaOpt);
+  parser.addOption (statusAddrOpt);
+  parser.addOption (statusPortOpt);
+  parser.addOption (statusIfaceOpt);
   parser.process (app);
 
-  QString const host = parser.value (hostOpt);
-  quint16 const port = static_cast<quint16> (parser.value (portOpt).toUInt ());
   QString const station = parser.value (stationOpt);
-  QString const band = parser.value (bandOpt);
+  QString const controller = parser.value (controllerOpt);
   int const hold_timeout_ms = parser.value (ttlOpt).toInt ();
   bool const fixed_hang_set = parser.isSet (fixedHangOpt);
   int const fixed_hang_ms = fixed_hang_set ? parser.value (fixedHangOpt).toInt () : 0;
@@ -756,44 +783,93 @@ int main (int argc, char * argv[])
       err << "ttl-ms (hold_timeout_ms) must be 100..30000\n";
       return 2;
     }
+  if (!inhibit_identity_ok (controller))
+    {
+      QTextStream err (stderr);
+      err << "controller-id must be printable, non-empty, and have no spaces\n";
+      return 2;
+    }
+  if (!inhibit_station_ok (station))
+    {
+      QTextStream err (stderr);
+      err << "station must be printable and at most 128 bytes\n";
+      return 2;
+    }
+  QString const status_iface = parser.value (statusIfaceOpt);
+  bool status_port_ok = false;
+  uint const status_port_u = parser.value (statusPortOpt).toUInt (&status_port_ok);
+  if (!status_port_ok || status_port_u == 0 || status_port_u > 65535)
+    {
+      QTextStream err (stderr);
+      err << "status-port must be 1..65535\n";
+      return 2;
+    }
+  quint16 const status_port = static_cast<quint16> (status_port_u);
+  QHostAddress status_limit;
+  if (parser.isSet (statusAddrOpt))
+    {
+      status_limit = QHostAddress {parser.value (statusAddrOpt)};
+      if (status_limit.isNull ()
+          || status_limit.protocol () != QAbstractSocket::IPv4Protocol)
+        {
+          QTextStream err (stderr);
+          err << "status-addr must be an IPv4 address\n";
+          return 2;
+        }
+    }
 
   // Some of these are only read inside platform-specific blocks below.
   [[maybe_unused]] InputMode input_mode = global_keys ? InputMode::GlobalKeys : InputMode::StdinTerminal;
 
   QString input_note;
-  // Linux: require EVIOCGKEY (group 'input'). No stdin-sticky fallback - that
-  // cannot measure KEY level and always reports ~40 WPM marks.
+  // /dev/input is optional. Windows uses the console key state. Linux uses
+  // the same terminal KEY when the device does not open.
   [[maybe_unused]] bool use_evdev_level = false;
   [[maybe_unused]] bool focus_arm_evdev = false; // arm only after stdin grave when not --global-keys
 #if defined (Q_OS_LINUX)
-  if (!open_evdev_keyboard ())
+  if (open_evdev_keyboard ())
     {
-      QTextStream err (stderr);
-      err << "inhibit-test: refusing to start (need true KEY level via /dev/input).\n"
-          << "  " << (g_evdev_fail_reason.isEmpty ()
-                      ? QStringLiteral ("could not open a keyboard device")
-                      : g_evdev_fail_reason)
-          << "\n"
-          << "  Verify after re-login:  groups | grep -w input\n";
-      return 1;
+      use_evdev_level = true;
+      (void) setup_stdin_raw (); // quit always; KEY arm when not --global-keys
+      if (input_mode == InputMode::GlobalKeys)
+        {
+          input_note = QStringLiteral (
+              "KEY = grave/` via /dev/input EVIOCGKEY (true level, SYSTEM-WIDE). "
+              "q/Esc also system-wide.");
+        }
+      else
+        {
+          // True level only after a grave press *into this terminal*, so other
+          // windows cannot start a hold. Release tracked via EVIOCGKEY.
+          focus_arm_evdev = true;
+          input_note = QStringLiteral (
+              "KEY = grave/` only when typed in *this terminal* "
+              "(EVIOCGKEY level after TTY press; other windows ignored). "
+              "q/Esc only from this terminal. --global-keys for system-wide KEY.");
+        }
     }
-  use_evdev_level = true;
-  (void) setup_stdin_raw (); // quit always; KEY arm when not --global-keys
-  if (input_mode == InputMode::GlobalKeys)
+  else if (setup_stdin_raw ())
     {
       input_note = QStringLiteral (
-          "KEY = grave/` via /dev/input EVIOCGKEY (true level, SYSTEM-WIDE). "
-          "q/Esc also system-wide.");
+          "KEY = grave/` from this terminal. Each press lasts %1 ms. "
+          "/dev/input is closed (%2). q/Esc and digits 1-9 from this terminal.")
+          .arg (kStdinStickyMs)
+          .arg (g_evdev_fail_reason.isEmpty ()
+                    ? QStringLiteral ("no keyboard device")
+                    : g_evdev_fail_reason);
+      if (input_mode == InputMode::GlobalKeys)
+        {
+          input_note += QStringLiteral (
+              " System-wide KEY needs /dev/input. This run stays in this terminal.");
+        }
     }
   else
     {
-      // True level only after a grave press *into this terminal*, so other
-      // windows cannot start a hold. Release tracked via EVIOCGKEY.
-      focus_arm_evdev = true;
       input_note = QStringLiteral (
-          "KEY = grave/` only when typed in *this terminal* "
-          "(EVIOCGKEY level after TTY press; other windows ignored). "
-          "q/Esc only from this terminal. --global-keys for system-wide KEY.");
+          "No terminal and no /dev/input (%1). KEY is idle. Type 17 listen still runs.")
+          .arg (g_evdev_fail_reason.isEmpty ()
+                    ? QStringLiteral ("no keyboard device")
+                    : g_evdev_fail_reason);
     }
 #elif defined (Q_OS_UNIX)
   QTextStream err_unix (stderr);
@@ -821,7 +897,32 @@ int main (int argc, char * argv[])
 #endif
 
   QUdpSocket sock;
-  qint64 seq = 1;
+  QUdpSocket status_sock;
+  QHash<QString, InhibitStation> stations;
+  SourceChoice choice;
+  bool status_open = false;
+  bool multicast_joined = false;
+  QString status_note;
+  if (status_limit.isNull () || status_limit.isMulticast ())
+    {
+      QHostAddress const group = status_limit.isNull ()
+          ? QHostAddress {QString::fromLatin1 (kDefaultMulticast)}
+          : status_limit;
+      status_note = open_inhibit_listen (status_sock, status_port, group,
+                                         status_iface, &status_open, &multicast_joined);
+    }
+  else
+    {
+      status_note = open_status_listen (status_sock, status_limit.toString (),
+                                        status_port, status_iface, &status_open);
+    }
+  if (!status_open)
+    {
+      QTextStream err (stderr);
+      err << status_note << '\n';
+    }
+  // The listen note already reports a failed multicast join.
+  (void) multicast_joined;
   KeyingMonitor keying;   // KEYing monitor SM
   int holds_sent = 0;
   int keepalives_sent = 0;
@@ -847,17 +948,14 @@ int main (int argc, char * argv[])
   QTimer keepalive;
   keepalive.setInterval (kKeepaliveMs);
 
-  // Hold sender: only path that emits UDP (race-safe vs keepalives).
-  // release_reason: optional note on RELEASE lines only (one log line per packet).
-  auto send_hold_packet = [&] (int ttl, bool is_keepalive,
-                               char const * release_reason = nullptr) {
-    if (is_keepalive && !hold_active)
-      {
-        return; // END_HOLD already cleared hold_active
-      }
-    QByteArray payload = encode_hold (station, band, seq++, ttl);
-    qint64 n = sock.writeDatagram (payload, QHostAddress (host), port);
-    QTextStream out (stdout);
+  // Hold sender: only path that emits type 18 (race-safe vs keepalives).
+  // The datagram goes to the one selected type 17 source.
+  auto send_one = [&] (InhibitStation const& target, int ttl, bool is_keepalive,
+                       char const * release_reason) {
+    QByteArray payload = encode_tx_inhibit (target.schema, target.id, controller,
+                                            static_cast<quint32> (ttl), station);
+    qint64 const n = sock.writeDatagram (payload, target.address, target.port);
+    QTextStream log (stdout);
     char const * tag = ttl == 0 ? "RELEASE" : (is_keepalive ? "KEEPALIVE" : "HOLD");
     if (ttl == 0)
       {
@@ -873,25 +971,59 @@ int main (int argc, char * argv[])
       }
     if (verbose_ka || !is_keepalive || ttl == 0)
       {
-        out << QDateTime::currentDateTime ().toString (QStringLiteral ("hh:mm:ss.zzz"))
+        log << QDateTime::currentDateTime ().toString (QStringLiteral ("hh:mm:ss.zzz"))
             << "  " << tag
             << "  ttl_ms=" << ttl
-            << "  -> " << host << ':' << port
+            << "  -> " << target.address.toString () << ':' << target.port
+            << "  id=\"" << target.id << "\""
+            << "  schema=" << target.schema
             << "  (holds=" << holds_sent
             << " ka=" << keepalives_sent
             << " rel=" << releases_sent << ")";
         if (ttl == 0 && release_reason && release_reason[0])
           {
-            out << "  (" << release_reason << ")";
+            log << "  (" << release_reason << ")";
           }
-        out << '\n';
-        out.flush ();
+        log << '\n';
+        log.flush ();
       }
     if (n < 0)
       {
         QTextStream err (stderr);
         err << "send failed: " << sock.errorString () << '\n';
       }
+  };
+
+  auto send_hold_packet = [&] (int ttl, bool is_keepalive,
+                               char const * release_reason = nullptr) {
+    if (is_keepalive && !hold_active)
+      {
+        return; // END_HOLD already cleared hold_active
+      }
+    InhibitStation target;
+    if (!station_by_id (stations, choice.selected_id, &target))
+      {
+        if (!is_keepalive)
+          {
+            QList<InhibitStation> const sources = supported_stations (stations);
+            QTextStream log (stdout);
+            log << QDateTime::currentDateTime ().toString (QStringLiteral ("hh:mm:ss.zzz"))
+                << "  " << (ttl == 0 ? "RELEASE" : "HOLD")
+                << "  ttl_ms=" << ttl;
+            if (sources.size () >= 2)
+              {
+                int const shown = std::min (sources.size (), 9);
+                log << "  press 1-" << shown << " to select a type 17 source\n";
+              }
+            else
+              {
+                log << "  waiting for a supported type 17\n";
+              }
+            log.flush ();
+          }
+        return;
+      }
+    send_one (target, ttl, is_keepalive, release_reason);
   };
 
   // END_HOLD: cancel keepalives first, then ttl_ms=0 (docs s3.6).
@@ -928,11 +1060,16 @@ int main (int argc, char * argv[])
 
   // Banner uses ASCII only so logs stay readable on non-UTF-8 terminals.
   QTextStream out (stdout);
-  out << "inhibit-test (KEY agent) -> " << host << ':' << port << '\n'
+  out << "inhibit-test (KEY agent)\n"
+      << "  " << status_note << '\n'
+      << "  one type 17 source is selected\n"
+      << "  two or more sources: press 1-9 in this window to select\n"
+      << "  type 18 goes to the selected sender\n"
       << "  ` (grave) = KEY level: hold to assert, release to open  - not Space\n"
       << "  ~ (shift+grave) = LATCH on; press ` or ~ again to release\n"
       << "  q or Esc  = release hold and quit\n"
-      << "  station=" << station << "  band=" << band << '\n'
+      << "  controller=" << controller
+      << "  station=" << station << '\n'
       << "  hold_timeout_ms=" << hold_timeout_ms
       << "  keepalive every " << kKeepaliveMs << " ms while hold active\n"
       << "  key poll=" << poll_ms << " ms"
@@ -950,6 +1087,122 @@ int main (int argc, char * argv[])
       << "  Or: --fixed-hang-ms 0 for immediate release on KEY open.\n"
       << "  See docs/TX_INHIBIT.md s3 (Hold sender + KEYing monitor).\n\n";
   out.flush ();
+  QString shown_menu;
+
+  if (status_open)
+    {
+      QObject::connect (&status_sock, &QUdpSocket::readyRead, &app, [&] () {
+          while (status_sock.hasPendingDatagrams ())
+            {
+              qint64 const pending = status_sock.pendingDatagramSize ();
+              if (pending <= 0)
+                {
+                  break;
+                }
+              QByteArray datagram;
+              datagram.resize (static_cast<int> (pending));
+              QHostAddress sender;
+              quint16 sender_port = 0;
+              if (status_sock.readDatagram (datagram.data (), datagram.size (),
+                                            &sender, &sender_port) < 0)
+                {
+                  continue;
+                }
+              InhibitStatusFields fields;
+              if (!read_inhibit_status (datagram, &fields))
+                {
+                  continue;
+                }
+              out << QDateTime::currentDateTime ().toString (QStringLiteral ("hh:mm:ss.zzz"))
+                  << "  " << format_inhibit_status (fields)
+                  << "  from " << sender.toString () << ':' << sender_port << '\n';
+              out.flush ();
+              AnnounceResult const seen = observe_inhibit_announce (
+                  &stations, fields, sender, sender_port);
+              if (seen.effect == AnnounceEffect::Learned
+                  || seen.effect == AnnounceEffect::Moved
+                  || seen.effect == AnnounceEffect::Withdraw)
+                {
+                  out << QDateTime::currentDateTime ().toString (QStringLiteral ("hh:mm:ss.zzz"))
+                      << "  CONFIG";
+                  if (seen.effect == AnnounceEffect::Withdraw)
+                    {
+                      out << "  withdrawn  id=\"" << seen.previous.id << "\""
+                          << "  was " << seen.previous.address.toString ()
+                          << ':' << seen.previous.port;
+                    }
+                  else
+                    {
+                      out << "  id=\"" << seen.current.id << "\""
+                          << "  schema=" << seen.current.schema
+                          << "  -> " << seen.current.address.toString ()
+                          << ':' << seen.current.port
+                          << "  supported=yes";
+                    }
+                  out << '\n';
+                  out.flush ();
+                }
+              QList<InhibitStation> const sources = supported_stations (stations);
+              ChoiceDecision const decision = decide_source_choice (&choice, sources);
+              if (decision.action == ChoiceAction::AutoSelected)
+                {
+                  int const index = inhibit_source_index (sources, choice.selected_id);
+                  out << QDateTime::currentDateTime ().toString (QStringLiteral ("hh:mm:ss.zzz"))
+                      << "  SELECT  " << (index + 1)
+                      << "  id=\"" << choice.selected_id << "\""
+                      << "  only type 17 source\n";
+                  out.flush ();
+                }
+              else if (decision.action == ChoiceAction::Cleared)
+                {
+                  out << QDateTime::currentDateTime ().toString (QStringLiteral ("hh:mm:ss.zzz"))
+                      << "  SELECT  no type 17 source\n";
+                  out.flush ();
+                }
+              if (hold_active && !decision.release_id.isEmpty ())
+                {
+                  auto const it = stations.constFind (decision.release_id);
+                  if (it != stations.cend ())
+                    {
+                      char const * why = decision.action == ChoiceAction::Cleared
+                          ? "type 17 withdrawn" : "source change";
+                      send_one (*it, 0, false, why);
+                    }
+                }
+              if (hold_active && decision.action == ChoiceAction::AutoSelected)
+                {
+                  InhibitStation cur;
+                  if (station_by_id (stations, choice.selected_id, &cur))
+                    {
+                      send_one (cur, hold_timeout_ms, false, nullptr);
+                    }
+                }
+              // An endpoint change keeps the same id. The choice helper does not see it.
+              if (hold_active
+                  && seen.effect == AnnounceEffect::Moved
+                  && seen.current.id == choice.selected_id
+                  && decision.release_id != seen.current.id)
+                {
+                  send_one (seen.previous, 0, false, "type 17 moved");
+                  send_one (seen.current, hold_timeout_ms, false, nullptr);
+                }
+              if (sources.size () >= 2)
+                {
+                  QString const key = source_menu_key (sources);
+                  if (key != shown_menu)
+                    {
+                      out << format_source_menu (sources, choice.selected_id);
+                      out.flush ();
+                      shown_menu = key;
+                    }
+                }
+              else
+                {
+                  shown_menu.clear ();
+                }
+            }
+        });
+    }
 
   QObject::connect (&keepalive, &QTimer::timeout, &app, [&] () {
       if (hold_active)
@@ -961,6 +1214,45 @@ int main (int argc, char * argv[])
   QTimer poll;
   poll.setInterval (poll_ms);
   QObject::connect (&poll, &QTimer::timeout, &app, [&] () {
+      // A digit chooses a type 17 source. It is not a KEY.
+      int const pick = take_choice_digit ();
+      if (pick > 0)
+        {
+          QList<InhibitStation> const list = supported_stations (stations);
+          QString previous;
+          if (apply_source_pick (&choice, list, pick, &previous))
+            {
+              if (hold_active && !previous.isEmpty ()
+                  && previous != choice.selected_id)
+                {
+                  auto const it = stations.constFind (previous);
+                  if (it != stations.cend ())
+                    {
+                      send_one (*it, 0, false, "selection");
+                    }
+                }
+              out << QDateTime::currentDateTime ().toString (QStringLiteral ("hh:mm:ss.zzz"))
+                  << "  SELECT  " << pick
+                  << "  id=\"" << choice.selected_id << "\"\n";
+              out.flush ();
+              InhibitStation cur;
+              if (hold_active && station_by_id (stations, choice.selected_id, &cur))
+                {
+                  send_one (cur, hold_timeout_ms, false, nullptr);
+                }
+              if (list.size () >= 2)
+                {
+                  out << format_source_menu (list, choice.selected_id);
+                  out.flush ();
+                  shown_menu = source_menu_key (list);
+                }
+              else
+                {
+                  shown_menu.clear ();
+                }
+            }
+        }
+
       qint64 t = now_ms ();
 
       bool want_quit = false;

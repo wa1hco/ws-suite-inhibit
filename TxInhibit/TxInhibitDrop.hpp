@@ -9,9 +9,22 @@
 // by the inhibit thread from message type 18. The inhibit thread samples
 // both and writes the pin once per wake. rig_set_ptt() is not used.
 //
-// A drop that clears a pin that was high stores two monotonic times.
-// t_rx_ns is taken when the type 18 datagram has been read. t_pin_ns is
-// taken when the pin write returns. A sender on this machine that calls
+// Unix, separate PTT device: opened when that port is selected, closed when
+// it is given up. Linux asserts RTS and DTR on open, so both lines are
+// cleared once. After that only the PTT bit is written. The other line
+// stays released. CTS is not read. A later KEY source would be the agent
+// hang output, OR'd with the type 18 hold, not the raw CTS level. A shared
+// port uses the fd Hamlib already holds.
+//
+// Windows, separate PTT device: HamlibTransceiver opens the COM port, clears
+// RTS and DTR once, and the inhibit thread holds that HANDLE.
+// EscapeCommFunction then writes only the PTT line. A shared port uses
+// Hamlib's handle through ser_set_rts or ser_set_dtr.
+//
+// set_inhibit_here() stores t_rx_ns and t_pin_ns when the call drops a pin
+// that was high. t_rx_ns is monotonic_ns() at the type 18 socket read.
+// t_pin_ns is monotonic_ns() when the pin write returns. take_pin_stamps()
+// returns that pair once. A sender on this machine that calls
 // monotonic_ns() immediately before sendto() can subtract:
 //   t_pin_ns - t_send  includes the thread wake
 //   t_pin_ns - t_rx_ns is only the work after the socket read returns
@@ -25,6 +38,7 @@
 #include <QtGlobal>
 
 #if defined(Q_OS_UNIX)
+#include <fcntl.h>
 #include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
@@ -110,7 +124,7 @@ namespace TxInhibitDrop
     return value;
   }
 
-  // Windows: Hamlib's port object, which owns the COM handle. Unused on Unix.
+  // Windows: Hamlib's port object, or a HANDLE this code owns.
   inline std::atomic<void *> & line_port ()
   {
     static std::atomic<void *> value {nullptr};
@@ -141,7 +155,33 @@ namespace TxInhibitDrop
     return value;
   }
 
+  // Separate PTT device on Unix. The path is written before separate_port() is set.
+  inline std::atomic<bool> & separate_port ()
+  {
+    static std::atomic<bool> value {false};
+    return value;
+  }
+
+  inline char * separate_path ()
+  {
+    static char path[512] {};
+    return path;
+  }
+
+  inline void copy_separate_path (char const * path)
+  {
+    char * dest = separate_path ();
+    std::size_t i = 0;
+    if (path)
+      {
+        for (; i < 511 && path[i] != '\0'; ++i) dest[i] = path[i];
+      }
+    dest[i] = '\0';
+  }
+
   // One-shot pair for the type 17 that reports this drop.
+  // The inhibit thread writes it after the pin write. The status path
+  // reads it once. A refresh does not call publish.
   struct PinStampPair
   {
     qint64 t_rx {0};
@@ -181,23 +221,76 @@ namespace TxInhibitDrop
       }
   }
 
-  // True when a pin write was issued. The caller stamps the clock after it.
-  inline bool write_pin (bool high)
+  inline void clear_pin_stamps ()
+  {
+    qint64 t_rx = 0;
+    qint64 t_pin = 0;
+    take_pin_stamps (t_rx, t_pin);
+  }
+
+  // CLOCK_MONOTONIC just after a successful drop ioctl. Zero if no ioctl ran.
+  inline qint64 clear_bit_ns (int fd, unsigned bit)
+  {
+#if defined(Q_OS_UNIX)
+    if (fd < 0 || bit == 0) return 0;
+#if defined(TIOCMBIC)
+    if (ioctl (fd, TIOCMBIC, &bit) < 0) return 0;
+#else
+    unsigned lines = 0;
+    if (ioctl (fd, TIOCMGET, &lines) != 0) return 0;
+    lines &= ~bit;
+    if (ioctl (fd, TIOCMSET, &lines) != 0) return 0;
+#endif
+    return monotonic_ns ();
+#else
+    Q_UNUSED (fd);
+    Q_UNUSED (bit);
+    return 0;
+#endif
+  }
+
+  inline void raise_pin ()
   {
 #if defined(Q_OS_UNIX)
     int const fd = line_fd ().load (std::memory_order_acquire);
     unsigned bit = line_bit ().load (std::memory_order_acquire);
-    if (fd < 0 || bit == 0) return false;
-#if defined(TIOCMBIS) && defined(TIOCMBIC)
-    return ioctl (fd, high ? TIOCMBIS : TIOCMBIC, &bit) == 0;
+    if (fd < 0 || bit == 0) return;
+#if defined(TIOCMBIS)
+    ioctl (fd, TIOCMBIS, &bit);
 #else
     unsigned lines = 0;
-    if (ioctl (fd, TIOCMGET, &lines) != 0) return false;
-    if (high) lines |= bit;
-    else lines &= ~bit;
-    return ioctl (fd, TIOCMSET, &lines) == 0;
+    if (ioctl (fd, TIOCMGET, &lines) != 0) return;
+    lines |= bit;
+    ioctl (fd, TIOCMSET, &lines);
 #endif
-#elif defined(Q_OS_WIN)
+#endif
+  }
+
+  // Inhibit thread only. The separate port is already open. This writes
+  // only the PTT bit. Returns the drop time, or zero when the pin was
+  // raised or no ioctl ran.
+  inline qint64 apply_separate (bool high)
+  {
+#if defined(Q_OS_UNIX)
+    unsigned const bit = line_bit ().load (std::memory_order_acquire);
+    int const fd = line_fd ().load (std::memory_order_acquire);
+    if (bit == 0 || fd < 0) return 0;
+    if (high)
+      {
+        raise_pin ();
+        return 0;
+      }
+    return clear_bit_ns (fd, bit);
+#else
+    Q_UNUSED (high);
+    return 0;
+#endif
+  }
+
+#if defined(Q_OS_WIN)
+  // True when a pin write was issued. The caller stamps the clock after it.
+  inline bool write_pin (bool high)
+  {
     void * token = line_port ().load (std::memory_order_acquire);
     unsigned const bit = line_bit ().load (std::memory_order_relaxed);
     bool const owned = own_fd ().load (std::memory_order_relaxed);
@@ -217,20 +310,32 @@ namespace TxInhibitDrop
                                   : bit == kPinDtr ? ser_set_dtr (port, high ? 1 : 0)
                                                    : -1;
     return rc == 0;
-#else
-    Q_UNUSED (high);
-    return false;
-#endif
   }
+#endif
 
-  // Inhibit thread only. Zero when no pin write ran.
-  // The returned time is after the write returns.
+  // Inhibit thread only. Returns the drop time, or zero when the pin was
+  // raised or no write ran.
   inline qint64 apply ()
   {
     bool const high = pin_level (ptt_intent ().load (std::memory_order_acquire),
                                  inhibit ().load (std::memory_order_acquire));
+#if defined(Q_OS_WIN)
     if (!write_pin (high)) return 0;
     return monotonic_ns ();
+#else
+    if (separate_port ().load (std::memory_order_acquire))
+      {
+        return apply_separate (high);
+      }
+    if (high)
+      {
+        raise_pin ();
+        return 0;
+      }
+    int const fd = line_fd ().load (std::memory_order_acquire);
+    unsigned const bit = line_bit ().load (std::memory_order_acquire);
+    return clear_bit_ns (fd, bit);
+#endif
   }
 
   inline void wake ()
@@ -289,16 +394,55 @@ namespace TxInhibitDrop
 
   inline void publish (int fd, unsigned bit, bool owned)
   {
+    separate_port ().store (false, std::memory_order_release);
     line_bit ().store (bit, std::memory_order_release);
-    own_fd ().store (owned, std::memory_order_release);
     line_port ().store (nullptr, std::memory_order_release);
-    line_fd ().store (fd, std::memory_order_release);
+    int const old = line_fd ().exchange (fd, std::memory_order_acq_rel);
+    bool const was_owned = own_fd ().exchange (owned, std::memory_order_acq_rel);
+#if defined(Q_OS_UNIX)
+    if (was_owned && old >= 0 && old != fd) ::close (old);
+#else
+    Q_UNUSED (old);
+    Q_UNUSED (was_owned);
+#endif
+    wake ();
+  }
+
+  // Separate PTT device. Open now, and hold until shutdown or a later publish.
+  // Linux open asserts both modem lines. Clear them once here. Later applies
+  // write only `bit`.
+  inline void publish_separate (char const * path, unsigned bit)
+  {
+    copy_separate_path (path);
+    line_bit ().store (bit, std::memory_order_release);
+    line_port ().store (nullptr, std::memory_order_release);
+    int const old = line_fd ().exchange (-1, std::memory_order_acq_rel);
+    bool const was_owned = own_fd ().exchange (true, std::memory_order_acq_rel);
+#if defined(Q_OS_UNIX)
+    if (was_owned && old >= 0) ::close (old);
+    int fd = -1;
+    if (path != nullptr && path[0] != '\0')
+      {
+        fd = ::open (path, O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+      }
+    if (fd >= 0)
+      {
+        unsigned const both = TIOCM_RTS | TIOCM_DTR;
+        ioctl (fd, TIOCMBIC, &both);
+        line_fd ().store (fd, std::memory_order_release);
+      }
+#else
+    Q_UNUSED (old);
+    Q_UNUSED (was_owned);
+#endif
+    separate_port ().store (true, std::memory_order_release);
     wake ();
   }
 
   // Shared COM port. Hamlib keeps the handle, so shutdown does not close it.
   inline void publish_port (void * port, unsigned bit)
   {
+    separate_port ().store (false, std::memory_order_relaxed);
     line_bit ().store (bit, std::memory_order_relaxed);
     own_fd ().store (false, std::memory_order_relaxed);
     line_fd ().store (-1, std::memory_order_relaxed);
@@ -309,6 +453,7 @@ namespace TxInhibitDrop
   // Separate PTT COM port. Caller owns the HANDLE and shutdown closes it.
   inline void publish_handle (void * handle, unsigned bit)
   {
+    separate_port ().store (false, std::memory_order_relaxed);
     line_bit ().store (bit, std::memory_order_relaxed);
     own_fd ().store (true, std::memory_order_relaxed);
     line_fd ().store (-1, std::memory_order_relaxed);
@@ -321,10 +466,12 @@ namespace TxInhibitDrop
   {
     ptt_intent ().store (false, std::memory_order_release);
     inhibit ().store (false, std::memory_order_release);
-    write_pin (false);
+    apply ();
+    clear_pin_stamps ();
     int const fd = line_fd ().exchange (-1, std::memory_order_acq_rel);
     void * token = line_port ().exchange (nullptr, std::memory_order_acq_rel);
     bool const owned = own_fd ().exchange (false, std::memory_order_acq_rel);
+    separate_port ().store (false, std::memory_order_release);
     line_bit ().store (0, std::memory_order_release);
 #if defined(Q_OS_UNIX)
     Q_UNUSED (token);

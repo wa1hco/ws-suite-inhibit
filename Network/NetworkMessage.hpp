@@ -550,11 +550,12 @@
  *      unsupported snapshot withdraws the advertisement. Inhibited means at
  *      least one hold is active. Source station summarizes the holders.
  *      Counters are cumulative for the current transceiver lifetime.
- *      t_rx_ns is the monotonic clock at the type 18 socket read.
- *      t_pin_ns is that clock when the RTS or DTR write returns.
- *      Both are zero on a heartbeat and on any status that did not drop a
- *      pin that was high. A sender on the same machine calls
- *      TxInhibitDrop::monotonic_ns() immediately before sendto. Then
+ *      t_rx_ns is monotonic_ns() at the type 18 socket read. t_pin_ns is
+ *      monotonic_ns() when the RTS or DTR write returns. Unix uses
+ *      CLOCK_MONOTONIC. Windows uses QueryPerformanceCounter. Both are
+ *      zero unless this message is the hold that dropped a pin that was
+ *      high. A heartbeat repeat sends both as zero. A sender on the same
+ *      machine calls monotonic_ns() immediately before sendto. Then
  *      t_pin_ns - t_send includes the thread wake, and t_pin_ns - t_rx_ns
  *      is only the work after the read returns. Readers that stop after
  *      Invalid ignore the pair.
